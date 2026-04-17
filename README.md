@@ -15,7 +15,59 @@ User query → Interpret → Fetch (ClickHouse) → Generate report → Render c
            → Compliance check → Human review → Publish → Auto-file
 ```
 
-## Demo
+## User Journey — Step by Step
+
+### 1. Open IRIS
+The analyst opens the dashboard. The sidebar shows **Agent** (chat) and **Report Status** (kanban) navigation, plus a tree of published reports and connected data sources. Everything starts empty.
+
+### 2. Ask for a report
+The analyst clicks **Agent** and types: *"Show me loan portfolio by branch for last quarter"*. Or clicks one of the preset example queries. The message is sent to the backend via `POST /api/iris/action`.
+
+### 3. Intent detection
+IRIS detects the intent — **report** (generate new) or **search** (find existing). Keyword matching routes the request:
+- *"Show me loan portfolio..."* → **report** (triggers the WOT pipeline)
+- *"Find reports about credit risk"* → **search** (queries Neo4j + ClickHouse + Graphiti)
+
+### 4. A card appears on the Kanban board
+For report requests, a card is created in the **To Do** column of the Kanban board. The analyst can switch to **Report Status** to watch it move through the pipeline in real-time.
+
+### 5. Pipeline executes (7 steps, all visible)
+
+| Step | What happens | Card moves to |
+|------|-------------|---------------|
+| **Interpret** | Qwen 3.6-Plus parses the query → extracts domain (`loans`), metrics (`total_disbursed`, `outstanding_balance`), dimensions (`branch`), time range (`last_quarter`). Confidence: 0.95. | Interpreting |
+| **Fetch** | SQL query built automatically → `SELECT branch, avg(total_disbursed) FROM dwh.fact_loans WHERE period='2025-Q4' GROUP BY branch` → executed on ClickHouse Cloud → 8 rows returned in 50ms. | Fetching Data |
+| **Generate** | Qwen generates a structured report: title, executive summary, 2-4 data sections with analysis, chart type suggestions (bar/line/pie), methodology note. Responds in the user's language. | Generating |
+| **Charts** | For each section with a chart type: XML report built with `<blackbox tag="chart">` placeholders → chart sub-pipeline (elaborate → implement SVG → test → verify) → final HTML with embedded SVG charts. | Charts |
+| **Compliance** | 5 banking governance rules checked: minimum data rows (DQ001), no negative monetary values (DQ002), no PII exposure (AC001), methodology mentioned (ACC001), executive summary present (ACC002). Score: 1.0, passed. | Compliance |
+| **Review** | Auto-approved if compliance score ≥ 0.8. Otherwise, the card stays in Review for human decision: approve / request revision (with notes) / reject. Revision loops back to Generate (max 3 cycles). | Review |
+| **Publish** | Report tracked in ClickHouse (`dwh.report_tracking`), indexed in Neo4j (graph relationships: report → department, report → charts), event published to Redpanda (`sb5.report.events`). | Published |
+
+Each step pushes SSE events (`step.completed`, `agent.message`) — the frontend updates the chat and Kanban board in real-time.
+
+### 6. Report auto-filed into TreeFile
+After publishing, the semantic router (FastEmbed, BAAI/bge-small-en-v1.5) matches the report content against folder descriptions:
+- *"Loan Portfolio by Branch Q4"* → **Loan Reports / Portfolio Analysis** (cosine similarity: 0.83)
+
+The report appears in the sidebar TreeFile under the matched folder.
+
+### 7. Report HTML available
+The generated HTML report (with embedded SVG charts, styled tables, compliance badge) is available for preview. The `report.ready` SSE event delivers the full HTML to the frontend.
+
+### 8. Search existing reports
+Later, the analyst asks: *"Find reports about credit risk"*. IRIS searches simultaneously:
+- **Graphiti** (semantic) → *"Branch-C recorded an NPL ratio of 7.1% for Q4 2025"*
+- **Neo4j** (graph) → reports linked to department/type
+- **ClickHouse** (SQL) → `report_tracking` table fulltext match
+
+Results are merged, deduplicated, and returned with source attribution.
+
+### 9. Iterate
+The analyst can generate more reports, each appearing on the Kanban board and auto-filing into the tree. The chat history is preserved via `ChatContextManager`. Session survives page reload (sessionStorage).
+
+---
+
+## Dashboard Sections
 
 ### Agent — Conversational Report Generation
 
