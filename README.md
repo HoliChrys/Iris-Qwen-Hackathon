@@ -46,7 +46,7 @@ For report requests, a card is created in the **To Do** column of the Kanban boa
 Each step pushes SSE events (`step.completed`, `agent.message`) — the frontend updates the chat and Kanban board in real-time.
 
 ### 6. Report auto-filed into TreeFile
-After publishing, the semantic router (FastEmbed, BAAI/bge-small-en-v1.5) matches the report content against folder descriptions:
+After publishing, the semantic router (Qwen `text-embedding-v3` via DashScope, 1024-dim) matches the report content against folder descriptions:
 - *"Loan Portfolio by Branch Q4"* → **Loan Reports / Portfolio Analysis** (cosine similarity: 0.83)
 
 The report appears in the sidebar TreeFile under the matched folder.
@@ -102,7 +102,7 @@ Cards update in real-time via Server-Sent Events as each pipeline step completes
 
 ### Reports — Semantic Auto-Filing
 
-Published reports are automatically categorized into folders using **FastEmbed** (local embedding model). The semantic router matches report content against folder descriptions:
+Published reports are automatically categorized into folders using **Qwen `text-embedding-v3`** via Alibaba Cloud DashScope (1024-dim). The semantic router matches report content against folder descriptions:
 
 - *Loan Portfolio Report* → `Loan Reports / Portfolio Analysis` (score: 0.83)
 - *NPL Ratio Monitoring* → `Loan Reports / NPL Monitoring` (score: 0.81)
@@ -194,6 +194,106 @@ Connected data sources visible in the sidebar:
 └──────────────────────────────────────────────────────────────┘
 ```
 
+## How Qwen Powers IRIS
+
+Qwen 3.6-Plus and Alibaba Cloud DashScope are used at **every layer** of the platform — not just for chat.
+
+### Chat — Conversational Agent
+The IRIS agent uses **Qwen 3.6-Plus** as its reasoning engine. When a user types a message, Qwen:
+- Understands the intent (report generation vs search)
+- Calls the right `@tool` methods on the `ReportRequest` StatefulRecord
+- Generates human-readable responses in the user's language
+- Handles multi-turn conversation with context from `ChatContextManager`
+
+```
+User: "Montre-moi le portefeuille de prêts par agence"
+Qwen: calls save_interpretation(domain="loans", metrics="total_disbursed,outstanding_balance", ...)
+Qwen: "I'll generate a loan portfolio report by branch. Interpreting your query..."
+```
+
+### Pipeline — 7 Agent Steps
+Each pipeline step is an `AgentEntity` driven by **Qwen 3.6-Plus** with tool calling (`tool_choice: required`). The LLM doesn't just generate text — it calls Python tools:
+
+| Step | Qwen does | Tool called |
+|------|-----------|-------------|
+| **Interpret** | Parses NL query → structured params | `save_interpretation(domain, metrics, dimensions)` |
+| **Fetch** | Triggers data warehouse query | `fetch_warehouse_data()` |
+| **Generate** | Creates structured report with sections | `save_report(title, summary, sections)` |
+| **Charts** | Plans chart implementation | `render_report_charts()` |
+| **Compliance** | Validates governance rules | `run_compliance_check()` |
+| **Review** | Decides approve/revise/reject | `approve()` or `request_revision(notes)` |
+| **Publish** | Finalizes and tracks | `publish_report()` |
+
+### Kanban — Real-Time Status
+As Qwen completes each pipeline step, SSE events push updates to the frontend. The Kanban card moves from column to column — the user sees the agent thinking and working in real-time.
+
+```
+[To Do] → [Interpreting] → [Fetching] → [Generating] → [Charts] → [Compliance] → [Review] → [Published]
+    ↑         Qwen            SQL           Qwen          SVG         Rules          Qwen         Done
+```
+
+### Semantic Router — Auto-Filing Reports
+After a report is published, **Qwen `text-embedding-v3`** (1024-dim, via DashScope) embeds the report content and matches it against folder descriptions using cosine similarity:
+
+```python
+report = "Loan Portfolio by Branch Q4 — NPL ratio analysis"
+→ embed(report) via text-embedding-v3
+→ cosine_similarity(report_vec, folder_vecs)
+→ best match: "Loan Reports / Portfolio Analysis" (score: 0.83)
+```
+
+All 6 folder categories matched correctly in testing:
+
+| Report | Filed to | Score |
+|--------|----------|-------|
+| Loan Portfolio by Branch | Loan Reports / Portfolio Analysis | 0.83 |
+| NPL Ratio Monitoring | Loan Reports / NPL Monitoring | 0.81 |
+| Transaction Volume | Transaction Reports / By Channel | 0.78 |
+| Branch Performance | Branch Performance | 0.83 |
+| Customer Segmentation | Customer Analytics | 0.80 |
+| Deposit Growth | Deposit Reports | 0.78 |
+
+### Search — Semantic Knowledge Graph (Graphiti)
+When a user searches, **Qwen 3.6-Plus** powers Graphiti's entity extraction and fact retrieval:
+
+1. **Indexing**: When a report is published, its content is sent to Graphiti. Qwen extracts entities and relationships (e.g., *"Branch-C has NPL ratio 7.1%"*) and `text-embedding-v3` generates the vector.
+
+2. **Search**: The user's query is embedded with `text-embedding-v3`, then matched against stored facts via vector similarity + fulltext in Neo4j.
+
+```
+User: "Find reports about credit risk"
+→ embed("credit risk") via text-embedding-v3
+→ Graphiti search → Neo4j vector similarity
+→ "Branch-C recorded an NPL ratio of 7.1% for Q4 2025" (fact extracted by Qwen)
+→ "The loan portfolio reported an overall NPL ratio of 4.2%" (fact extracted by Qwen)
+```
+
+### Custom LLM Client — ZAILLMClient
+Graphiti expects OpenAI's `responses.parse` API for structured output. DashScope supports the Responses API but doesn't enforce schema constraints. Our `ZAILLMClient` solves this with a **retry-on-validation-error** pattern:
+
+1. Inject the Pydantic schema into the system prompt
+2. Call `chat.completions` with `response_format: json_object`
+3. Parse response with Pydantic model
+4. If `ValidationError` → send the error back to Qwen → Qwen self-corrects → retry (max 2)
+
+This makes Qwen 3.6-Plus work with any structured output schema without native schema enforcement.
+
+### Summary: Qwen Everywhere
+
+| Layer | Qwen Model | What it does |
+|-------|-----------|-------------|
+| **Chat** | qwen3.6-plus | Conversational agent, intent routing |
+| **Pipeline (7 steps)** | qwen3.6-plus | Tool calling on StatefulRecord |
+| **Report generation** | qwen3.6-plus | Structured report with sections + charts |
+| **Chart elaboration** | qwen3.6-plus | Plans SVG chart implementation |
+| **Compliance review** | qwen3.6-plus | Auto-approve/revise decision |
+| **Semantic filing** | text-embedding-v3 | Report → folder matching (cosine similarity) |
+| **Graphiti indexing** | qwen3.6-plus | Entity/fact extraction from reports |
+| **Graphiti search** | text-embedding-v3 | Query embedding for semantic search |
+| **Structured output** | qwen3.6-plus | JSON schema compliance (retry pattern) |
+
+---
+
 ## Key Innovations
 
 ### 1. Skill-Driven Agents
@@ -222,7 +322,7 @@ Graphiti (knowledge graph) uses Qwen 3.6-Plus for entity extraction and Alibaba'
 The `ReportRequest` is a Tachikoma `StatefulRecord` — a Faust Record with a state machine. Each pipeline step is a state, each `@tool` method is callable by the LLM agent. The state machine enforces transition conditions (e.g., can't generate without data, can't publish without compliance).
 
 ### 4. Semantic Auto-Filing
-Published reports are automatically placed in the right folder using `FastEmbed` (BAAI/bge-small-en-v1.5, local, no API). The semantic router matches report content against folder descriptions with cosine similarity. 6/6 correct in testing.
+Published reports are automatically placed in the right folder using Qwen `text-embedding-v3` via Alibaba Cloud DashScope (1024-dim). The semantic router matches report content against folder descriptions with cosine similarity. 6/6 correct in testing.
 
 ### 5. Event-Driven Everything
 Every action produces events:
@@ -245,7 +345,7 @@ cp .env.example .env
 # Fill in your credentials
 
 # Backend
-pip install faust-streaming openai fastembed kafka-python-ng
+pip install faust-streaming openai kafka-python-ng
 PYTHONPATH=. uvicorn backend.api:app --host 0.0.0.0 --port 8001
 
 # Frontend
@@ -265,7 +365,7 @@ docker run -d --name graphiti -p 8002:8000 \
 | Layer | Technology |
 |-------|-----------|
 | **LLM** | Alibaba Cloud Qwen 3.6-Plus (DashScope API) |
-| **Embeddings** | Alibaba text-embedding-v3 (1024-dim) + FastEmbed local |
+| **Embeddings** | Alibaba Qwen `text-embedding-v3` (1024-dim, DashScope) |
 | **Framework** | Tachikoma (Faust + Ray + StatefulRecord) |
 | **Frontend** | React 19, Vite 6, Jotai, TanStack Query, Tailwind CSS |
 | **Data Warehouse** | ClickHouse Cloud (Germany) |
